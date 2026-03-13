@@ -181,6 +181,17 @@ func (p *Path) ParseDrawingInstructions() (chan *DrawingInstruction, chan error)
 }
 
 func (pdp *pathDescriptionParser) parseCommand(l *gl.Lexer, i gl.Item) error {
+	// Handle multi-character letter tokens (e.g. "ZM" with no whitespace)
+	if len(i.Value) > 1 {
+		for _, ch := range i.Value {
+			single := i
+			single.Value = string(ch)
+			if err := pdp.parseCommand(l, single); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	switch i.Value {
 	case "M":
@@ -205,12 +216,27 @@ func (pdp *pathDescriptionParser) parseCommand(l *gl.Lexer, i gl.Item) error {
 		return pdp.parseVLineToRel()
 	case "z", "Z":
 		return pdp.parseClose()
+	case "q":
+		return pdp.parseQuadraticToRel()
+	case "Q":
+		return pdp.parseQuadraticToAbs()
 	}
 
 	return fmt.Errorf("unknown command found in SVG: %s", i.Value)
 }
 
 func (pdp *pathDescriptionParser) parseCommandDrawingInstructions(l *gl.Lexer, i gl.Item) error {
+	// Handle multi-character letter tokens (e.g. "ZM" with no whitespace)
+	if len(i.Value) > 1 {
+		for _, ch := range i.Value {
+			single := i
+			single.Value = string(ch)
+			if err := pdp.parseCommandDrawingInstructions(l, single); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 
 	switch i.Value {
 	case "M":
@@ -235,6 +261,10 @@ func (pdp *pathDescriptionParser) parseCommandDrawingInstructions(l *gl.Lexer, i
 		return pdp.parseVLineToDI(i.Value == "V")
 	case "z", "Z":
 		return pdp.parseCloseDI()
+	case "q":
+		return pdp.parseQuadraticToRelDI()
+	case "Q":
+		return pdp.parseQuadraticToAbsDI()
 	}
 
 	return fmt.Errorf("unknown command found in SVG: %s", i.Value)
@@ -402,6 +432,13 @@ func (pdp *pathDescriptionParser) parseMoveToRelDI() error {
 
 	pdp.x += t[0]
 	pdp.y += t[1]
+
+	if pdp.p.group.Owner == nil {
+		pdp.p.group.Owner = &Svg{scale: 1}
+	}
+	if pdp.p.StrokeWidth == 0 {
+		pdp.p.StrokeWidth = 1
+	}
 
 	var tuples []Tuple
 	pdp.lex.ConsumeWhiteSpace()
@@ -868,6 +905,175 @@ func (pdp *pathDescriptionParser) parseCurveToAbs() error {
 		}
 	}
 
+	return nil
+}
+
+// parseQuadraticToRelDI handles the SVG `q` command (relative quadratic Bézier)
+// in ParseDrawingInstructions mode. Each segment is defined by 2 tuples:
+// (ctrl dx,dy) and (end dx,dy), both relative to the current position.
+// The quadratic is promoted to a cubic Bézier so it can be emitted as a
+// CurveInstruction with C1, C2, and T.
+func (pdp *pathDescriptionParser) parseQuadraticToRelDI() error {
+	var tuples []Tuple
+	pdp.lex.ConsumeWhiteSpace()
+	pdp.lex.ConsumeComma()
+	for pdp.lex.PeekItem().Type == gl.ItemNumber {
+		t, err := parseTuple(pdp.lex)
+		if err != nil {
+			return fmt.Errorf("Error parsing QuadraticToRel: %s", err)
+		}
+		tuples = append(tuples, t)
+		pdp.lex.ConsumeWhiteSpace()
+		pdp.lex.ConsumeComma()
+	}
+	for j := 0; j < len(tuples)/2; j++ {
+		startX, startY := pdp.x, pdp.y
+		ctrlX := startX + tuples[j*2][0]
+		ctrlY := startY + tuples[j*2][1]
+		endX := startX + tuples[j*2+1][0]
+		endY := startY + tuples[j*2+1][1]
+
+		cp1x := startX + (2.0/3.0)*(ctrlX-startX)
+		cp1y := startY + (2.0/3.0)*(ctrlY-startY)
+		cp2x := endX + (2.0/3.0)*(ctrlX-endX)
+		cp2y := endY + (2.0/3.0)*(ctrlY-endY)
+
+		pdp.x, pdp.y = endX, endY
+
+		c1x, c1y := pdp.transform.Apply(cp1x, cp1y)
+		c2x, c2y := pdp.transform.Apply(cp2x, cp2y)
+		tx, ty := pdp.transform.Apply(endX, endY)
+
+		pdp.p.instructions <- &DrawingInstruction{
+			Kind: CurveInstruction,
+			CurvePoints: &CurvePoints{
+				C1: &Tuple{c1x, c1y},
+				C2: &Tuple{c2x, c2y},
+				T:  &Tuple{tx, ty},
+			},
+		}
+	}
+	return nil
+}
+
+// parseQuadraticToAbsDI handles the SVG `Q` command (absolute quadratic Bézier)
+// in ParseDrawingInstructions mode.
+func (pdp *pathDescriptionParser) parseQuadraticToAbsDI() error {
+	var tuples []Tuple
+	pdp.lex.ConsumeWhiteSpace()
+	pdp.lex.ConsumeComma()
+	for pdp.lex.PeekItem().Type == gl.ItemNumber {
+		t, err := parseTuple(pdp.lex)
+		if err != nil {
+			return fmt.Errorf("Error parsing QuadraticToAbs: %s", err)
+		}
+		tuples = append(tuples, t)
+		pdp.lex.ConsumeWhiteSpace()
+		pdp.lex.ConsumeComma()
+	}
+	for j := 0; j < len(tuples)/2; j++ {
+		startX, startY := pdp.x, pdp.y
+		ctrlX := tuples[j*2][0]
+		ctrlY := tuples[j*2][1]
+		endX := tuples[j*2+1][0]
+		endY := tuples[j*2+1][1]
+
+		cp1x := startX + (2.0/3.0)*(ctrlX-startX)
+		cp1y := startY + (2.0/3.0)*(ctrlY-startY)
+		cp2x := endX + (2.0/3.0)*(ctrlX-endX)
+		cp2y := endY + (2.0/3.0)*(ctrlY-endY)
+
+		pdp.x, pdp.y = endX, endY
+
+		c1x, c1y := pdp.transform.Apply(cp1x, cp1y)
+		c2x, c2y := pdp.transform.Apply(cp2x, cp2y)
+		tx, ty := pdp.transform.Apply(endX, endY)
+
+		pdp.p.instructions <- &DrawingInstruction{
+			Kind: CurveInstruction,
+			CurvePoints: &CurvePoints{
+				C1: &Tuple{c1x, c1y},
+				C2: &Tuple{c2x, c2y},
+				T:  &Tuple{tx, ty},
+			},
+		}
+	}
+	return nil
+}
+
+// parseQuadraticToRel handles the SVG `q` command in Parse (segment) mode.
+func (pdp *pathDescriptionParser) parseQuadraticToRel() error {
+	var tuples []Tuple
+	pdp.lex.ConsumeWhiteSpace()
+	for pdp.lex.PeekItem().Type == gl.ItemNumber {
+		t, err := parseTuple(pdp.lex)
+		if err != nil {
+			return fmt.Errorf("Error parsing QuadraticToRel: %s", err)
+		}
+		tuples = append(tuples, t)
+		pdp.lex.ConsumeWhiteSpace()
+	}
+	x, y := pdp.transform.Apply(pdp.x, pdp.y)
+	pdp.currentsegment.addPoint([2]float64{x, y})
+	for j := 0; j < len(tuples)/2; j++ {
+		startX, startY := pdp.x, pdp.y
+		ctrlX := startX + tuples[j*2][0]
+		ctrlY := startY + tuples[j*2][1]
+		endX := startX + tuples[j*2+1][0]
+		endY := startY + tuples[j*2+1][1]
+
+		var cb cubicBezier
+		cb.controlpoints[0] = [2]float64{startX, startY}
+		cb.controlpoints[1] = [2]float64{startX + (2.0/3.0)*(ctrlX-startX), startY + (2.0/3.0)*(ctrlY-startY)}
+		cb.controlpoints[2] = [2]float64{endX + (2.0/3.0)*(ctrlX-endX), endY + (2.0/3.0)*(ctrlY-endY)}
+		cb.controlpoints[3] = [2]float64{endX, endY}
+
+		pdp.x, pdp.y = endX, endY
+
+		vertices := cb.recursiveInterpolate(10, 0)
+		for _, v := range vertices {
+			vx, vy := pdp.transform.Apply(v[0], v[1])
+			pdp.currentsegment.addPoint([2]float64{vx, vy})
+		}
+	}
+	return nil
+}
+
+// parseQuadraticToAbs handles the SVG `Q` command in Parse (segment) mode.
+func (pdp *pathDescriptionParser) parseQuadraticToAbs() error {
+	var tuples []Tuple
+	pdp.lex.ConsumeWhiteSpace()
+	for pdp.lex.PeekItem().Type == gl.ItemNumber {
+		t, err := parseTuple(pdp.lex)
+		if err != nil {
+			return fmt.Errorf("Error parsing QuadraticToAbs: %s", err)
+		}
+		tuples = append(tuples, t)
+		pdp.lex.ConsumeWhiteSpace()
+	}
+	x, y := pdp.transform.Apply(pdp.x, pdp.y)
+	pdp.currentsegment.addPoint([2]float64{x, y})
+	for j := 0; j < len(tuples)/2; j++ {
+		startX, startY := pdp.x, pdp.y
+		ctrlX := tuples[j*2][0]
+		ctrlY := tuples[j*2][1]
+		endX := tuples[j*2+1][0]
+		endY := tuples[j*2+1][1]
+
+		var cb cubicBezier
+		cb.controlpoints[0] = [2]float64{startX, startY}
+		cb.controlpoints[1] = [2]float64{startX + (2.0/3.0)*(ctrlX-startX), startY + (2.0/3.0)*(ctrlY-startY)}
+		cb.controlpoints[2] = [2]float64{endX + (2.0/3.0)*(ctrlX-endX), endY + (2.0/3.0)*(ctrlY-endY)}
+		cb.controlpoints[3] = [2]float64{endX, endY}
+
+		pdp.x, pdp.y = endX, endY
+
+		vertices := cb.recursiveInterpolate(10, 0)
+		for _, v := range vertices {
+			vx, vy := pdp.transform.Apply(v[0], v[1])
+			pdp.currentsegment.addPoint([2]float64{vx, vy})
+		}
+	}
 	return nil
 }
 
